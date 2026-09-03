@@ -24,6 +24,7 @@ import {
   type ToolResultMessage,
   type ModelCost,
   calculateCost,
+  clampThinkingLevel,
   createAssistantMessageEventStream,
 } from "@earendil-works/pi-ai";
 import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.models";
@@ -60,6 +61,14 @@ interface ModelConfigOverride {
   input?: ("text" | "image")[];
   cost?: ModelCost;
   openaiTokenLimit?: OpenAITokenLimitParam;
+  /**
+   * pi thinking level → wire `reasoning_effort` value. `null` means the level is
+   * not offered; a string for `off` is sent when reasoning is disabled (e.g.
+   * "none"); an absent/`null` `off` sends nothing when reasoning is disabled.
+   */
+  thinkingLevelMap?: Model<Api>["thinkingLevelMap"];
+  /** Whether to send `reasoning_effort` on the OpenAI-compatible route at all. */
+  supportsReasoningEffort?: boolean;
 }
 
 interface Config {
@@ -153,6 +162,10 @@ interface ResolvedModelDetails {
   cost: ModelCost;
   thinkingLevelMap?: Model<Api>["thinkingLevelMap"];
   openaiTokenLimit?: OpenAITokenLimitParam;
+  /** Send `reasoning_effort` on the OpenAI-compatible route (catalog compat default: true). */
+  supportsReasoningEffort: boolean;
+  /** Model needs `reasoning_content` on replayed assistant turns (DeepSeek). */
+  requiresReasoningContent: boolean;
   source: "config" | "catalog" | "fallback";
 }
 
@@ -164,6 +177,8 @@ const FALLBACK: ResolvedModelDetails = {
   reasoning: false,
   input: ["text"],
   cost: ZERO_COST,
+  supportsReasoningEffort: true,
+  requiresReasoningContent: false,
   source: "fallback",
 };
 
@@ -215,8 +230,11 @@ function resolveModelDetails(
   // Start with catalog metadata, or the conservative fallback if unknown.
   const base: ResolvedModelDetails = catalogModel
     ? (() => {
-        const compatMaxTokensField = (catalogModel as any).compat?.maxTokensField;
+        const compat = (catalogModel as any).compat ?? {};
+        const compatMaxTokensField = compat.maxTokensField;
         return {
+          supportsReasoningEffort: compat.supportsReasoningEffort !== false,
+          requiresReasoningContent: compat.requiresReasoningContentOnAssistantMessages === true,
           contextWindow: catalogModel.contextWindow,
           maxTokens: catalogModel.maxTokens,
           reasoning: catalogModel.reasoning,
@@ -247,9 +265,17 @@ function resolveModelDetails(
 }
 
 /** Per-deployment API route resolved at discovery time */
+interface OpenAIReasoningPolicy {
+  /** Model reasons and accepts `reasoning_effort`. */
+  enabled: boolean;
+  thinkingLevelMap?: Model<Api>["thinkingLevelMap"];
+  /** Replay `reasoning_content` on assistant turns (DeepSeek requires it). */
+  replayReasoningContent: boolean;
+}
+
 type ApiRoute =
   | { kind: "anthropic-messages" }
-  | { kind: "openai-chat-completions"; tokenLimit: OpenAITokenLimitParam };
+  | { kind: "openai-chat-completions"; tokenLimit: OpenAITokenLimitParam; reasoning: OpenAIReasoningPolicy };
 
 const apiRouteMap = new Map<string, ApiRoute>();
 
@@ -264,7 +290,35 @@ function inferOpenAITokenLimit(modelName: string, resolved: ResolvedModelDetails
 function resolveApiRoute(d: Deployment, resolved: ResolvedModelDetails): ApiRoute {
   if (d.modelPublisher === "Anthropic") return { kind: "anthropic-messages" };
   const modelName = d.modelName ?? d.name;
-  return { kind: "openai-chat-completions", tokenLimit: inferOpenAITokenLimit(modelName, resolved) };
+  return {
+    kind: "openai-chat-completions",
+    tokenLimit: inferOpenAITokenLimit(modelName, resolved),
+    reasoning: {
+      enabled: resolved.reasoning && resolved.supportsReasoningEffort,
+      thinkingLevelMap: resolved.thinkingLevelMap,
+      replayReasoningContent: resolved.requiresReasoningContent,
+    },
+  };
+}
+
+/**
+ * Resolve the wire `reasoning_effort` for a request, or undefined to omit it.
+ *
+ * Foundry defaults to no reasoning when the field is absent, and families
+ * disagree on which values they accept. The catalog's thinkingLevelMap encodes
+ * that: pi's level is clamped to a supported one, then mapped to the wire
+ * value. For "off", a string mapping (e.g. "none") is sent; null/absent sends
+ * nothing, which matters for models that reject "none".
+ */
+function resolveReasoningEffort(policy: OpenAIReasoningPolicy, requested: SimpleStreamOptions["reasoning"]): string | undefined {
+  if (!policy.enabled) return undefined;
+  const map = policy.thinkingLevelMap;
+  const probe = { reasoning: true, thinkingLevelMap: map } as Model<Api>;
+  const level = requested ? clampThinkingLevel(probe, requested) : "off";
+  const mapped = map?.[level];
+  if (level === "off") return typeof mapped === "string" ? mapped : undefined;
+  if (mapped === null) return undefined;
+  return mapped ?? level;
 }
 
 function describeApiRoute(route: ApiRoute): string {
@@ -340,7 +394,9 @@ async function* parseSSE(reader: ReadableStreamDefaultReader<Uint8Array>): Async
 // OpenAI-format message conversion  (for OpenAI / MoonshotAI / etc.)
 // =============================================================================
 
-function toOpenAIMessages(systemPrompt: string | undefined, messages: Message[]): unknown[] {
+function toOpenAIMessages(
+  systemPrompt: string | undefined, messages: Message[], opts: { replayReasoningContent?: boolean } = {},
+): unknown[] {
   const out: unknown[] = [];
   if (systemPrompt) out.push({ role: "system", content: systemPrompt });
 
@@ -366,6 +422,11 @@ function toOpenAIMessages(systemPrompt: string | undefined, messages: Message[])
       // turn, which a tool-call-only turn would otherwise produce.
       entry.content = text;
       if (tcs.length) entry.tool_calls = tcs;
+      // DeepSeek rejects replayed assistant turns without reasoning_content
+      // once thinking is on; an empty string is accepted.
+      if (opts.replayReasoningContent) {
+        entry.reasoning_content = msg.content.filter((b) => b.type === "thinking").map((b) => (b as ThinkingContent).thinking).join("\n");
+      }
       out.push(entry);
     } else if (msg.role === "toolResult") {
       const m = msg as ToolResultMessage;
@@ -445,13 +506,17 @@ function streamOpenAI(
 ): Promise<void> {
   return (async () => {
     const url = `${auth.gatewayUrl ?? baseHost}/openai/deployments/${model.id}/chat/completions?api-version=2024-10-21`;
-    const maxOutput = options?.maxTokens ?? model.maxTokens;
     const body: Record<string, unknown> = {
-      messages: toOpenAIMessages(context.systemPrompt, transformMessages(context.messages, model)),
-      [route.tokenLimit]: maxOutput,
+      messages: toOpenAIMessages(context.systemPrompt, transformMessages(context.messages, model), { replayReasoningContent: route.reasoning.replayReasoningContent }),
       stream: true,
       stream_options: { include_usage: true },
     };
+    // Only send an output cap when the caller asks for one, as pi-ai's own
+    // OpenAI provider does. Some catalog maxTokens values equal the context
+    // window (Kimi), and Azure rejects input + max_tokens > window with a 400.
+    if (options?.maxTokens) body[route.tokenLimit] = options.maxTokens;
+    const effort = resolveReasoningEffort(route.reasoning, options?.reasoning);
+    if (effort !== undefined) body.reasoning_effort = effort;
     if (context.tools?.length) body.tools = toOpenAITools(context.tools);
 
     const token = await auth.getToken();
@@ -695,7 +760,7 @@ function streamAzureFoundry(
 
     try {
       const baseHost = new URL(model.baseUrl).origin;
-      const route = apiRouteMap.get(model.id) ?? { kind: "openai-chat-completions", tokenLimit: "max_tokens" };
+      const route = apiRouteMap.get(model.id) ?? { kind: "openai-chat-completions", tokenLimit: "max_tokens", reasoning: { enabled: false, replayReasoningContent: false } };
       // Resolve auth: use registered provider auth, fall back to api-key from options.
       const auth: ProviderAuth = providerAuthMap.get(model.provider)
         ?? { type: "api-key", getToken: () => Promise.resolve(options?.apiKey ?? ""), headers: {} };

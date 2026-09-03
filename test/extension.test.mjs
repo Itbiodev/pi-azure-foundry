@@ -59,6 +59,8 @@ globalThis.fetch = async (url, init = {}) => {
       { name: "claude-haiku-4-5", modelName: "claude-haiku-4-5", modelPublisher: "Anthropic", capabilities: { chat_completion: "true" } },
       { name: "gpt-5-mini", modelName: "gpt-5-mini", modelPublisher: "OpenAI", capabilities: { chat_completion: "true" } },
       { name: "DeepSeek-V4-Flash", modelName: "DeepSeek-V4-Flash", modelPublisher: "DeepSeek", capabilities: { chat_completion: "true" } },
+      { name: "Kimi-K2.6", modelName: "Kimi-K2.6", modelPublisher: "MoonshotAI", capabilities: { chat_completion: "true" } },
+      { name: "gpt-5.4-nano", modelName: "gpt-5.4-nano", modelPublisher: "OpenAI", capabilities: { chat_completion: "true" } },
       { name: "my-custom-llm", modelName: "my-custom-llm", modelPublisher: "Contoso", capabilities: { chat_completion: "true" } },
       { name: "embed", modelName: "text-embedding-3-small", modelPublisher: "OpenAI", capabilities: { embeddings: "true" } },
     ] }), { status: 200 });
@@ -87,13 +89,44 @@ async function run(id, context, options) {
 console.log("discovery and metadata resolution");
 {
   check("discovery hits the Foundry endpoint, not the gateway", requests[0].url.startsWith(FOUNDRY), requests[0].url);
-  check("non-chat deployments are skipped", !models.embed && provider.models.length === 4, Object.keys(models).join(","));
+  check("non-chat deployments are skipped", !models.embed && provider.models.length === 6, Object.keys(models).join(","));
   check("catalog: gpt-5-mini is a reasoning model with cost", models["gpt-5-mini"].reasoning === true && models["gpt-5-mini"].cost.input > 0, JSON.stringify(models["gpt-5-mini"]));
   check("catalog: case-insensitive match for DeepSeek-V4-Flash", models["DeepSeek-V4-Flash"].contextWindow > 128000, JSON.stringify(models["DeepSeek-V4-Flash"]));
   const c = models["my-custom-llm"];
   check("override: fields applied over fallback", c.contextWindow === 9999 && c.maxTokens === 777 && c.cost.input === 1 && c.cost.output === 2, JSON.stringify(c));
   check("override: unspecified cost fields kept from base", c.cost.cacheRead === 0 && c.cost.cacheWrite === 0, JSON.stringify(c.cost));
   check("provider apiKey is the configured key", provider.apiKey === "KEY", provider.apiKey);
+  check("thinkingLevelMap passed through to pi", !!models["DeepSeek-V4-Flash"].thinkingLevelMap, JSON.stringify(models["DeepSeek-V4-Flash"]));
+}
+
+console.log("openai route: reasoning_effort and output cap policy");
+{
+  async function bodyFor(id, options) {
+    nextChat = { sse: [{ choices: [{ delta: { content: "x" }, finish_reason: "stop" }] }, "[DONE]"] };
+    const before = requests.length;
+    await run(id, { messages: [{ role: "user", content: "q" }, { role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", provider: "azure-foundry", api: "azure-foundry", model: id }, { role: "user", content: "q2" }] }, options);
+    return JSON.parse(requests[before].init.body);
+  }
+  let b = await bodyFor("DeepSeek-V4-Flash", {});
+  check("deepseek off: reasoning_effort omitted (Foundry default is none)", b.reasoning_effort === undefined, JSON.stringify(b));
+  check("no output cap sent unless requested", b.max_tokens === undefined && b.max_completion_tokens === undefined, JSON.stringify(Object.keys(b)));
+  check("deepseek: reasoning_content replayed on assistant turns", b.messages.find((m) => m.role === "assistant").reasoning_content === "", JSON.stringify(b.messages));
+  b = await bodyFor("DeepSeek-V4-Flash", { reasoning: "medium" });
+  check("deepseek medium: clamped to a supported level (high)", b.reasoning_effort === "high", JSON.stringify(b.reasoning_effort));
+  b = await bodyFor("DeepSeek-V4-Flash", { reasoning: "low", maxTokens: 500 });
+  check("deepseek low: sent as low", b.reasoning_effort === "low", JSON.stringify(b.reasoning_effort));
+  check("requested cap sent as max_tokens", b.max_tokens === 500, JSON.stringify(b));
+  b = await bodyFor("Kimi-K2.6", { reasoning: "high" });
+  check("kimi: never sends reasoning_effort (catalog: unsupported)", b.reasoning_effort === undefined, JSON.stringify(b));
+  check("kimi: no reasoning_content on replay", b.messages.find((m) => m.role === "assistant").reasoning_content === undefined, JSON.stringify(b.messages));
+  b = await bodyFor("gpt-5.4-nano", {});
+  check("gpt-5.4-nano off: sends 'none' (catalog off→none)", b.reasoning_effort === "none", JSON.stringify(b.reasoning_effort));
+  b = await bodyFor("gpt-5.4-nano", { reasoning: "xhigh", maxTokens: 50 });
+  check("gpt-5.4-nano xhigh: sent, cap uses max_completion_tokens", b.reasoning_effort === "xhigh" && b.max_completion_tokens === 50 && b.max_tokens === undefined, JSON.stringify(b));
+  b = await bodyFor("gpt-5-mini", {});
+  check("gpt-5-mini off: nothing sent (catalog off→null)", b.reasoning_effort === undefined, JSON.stringify(b.reasoning_effort));
+  b = await bodyFor("my-custom-llm", { reasoning: "high" });
+  check("fallback (non-reasoning) model: nothing sent", b.reasoning_effort === undefined, JSON.stringify(b.reasoning_effort));
 }
 
 console.log("openai route: request shape, gateway, headers");
@@ -153,7 +186,7 @@ console.log("openai route: non-gpt-5 model uses max_tokens");
   const before = requests.length;
   const { message } = await run("DeepSeek-V4-Flash", { messages: [{ role: "user", content: "17*23" }] }, {});
   const body = JSON.parse(requests[before].init.body);
-  check("max_tokens present", body.max_tokens === models["DeepSeek-V4-Flash"].maxTokens && body.max_completion_tokens === undefined, JSON.stringify(Object.keys(body)));
+  check("no cap field when none requested", body.max_tokens === undefined && body.max_completion_tokens === undefined, JSON.stringify(Object.keys(body)));
   check("plain text reply, stopReason stop", message.content[0]?.text === "391" && message.stopReason === "stop", JSON.stringify(message));
 }
 

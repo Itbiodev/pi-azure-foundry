@@ -129,7 +129,9 @@ Your deployments will appear in the pi model picker under the **Azure Foundry** 
 - **Config overrides** — you can pin or override details for any catalog model via the optional `models` property in `azure-foundry.config.json`. This takes precedence over the pi-ai catalog lookup and is useful for custom deployments, negotiated pricing, or models not yet in pi-ai. See the example below.
 - **Routing** — Anthropic deployments are routed to `/anthropic/v1/messages` (native Messages API with tool use and extended thinking). All other deployments use `/openai/deployments/{id}/chat/completions` (OpenAI-compatible). Newer GPT-5/o-series models use `max_completion_tokens` instead of `max_tokens`; this is inferred from model name or set explicitly in `models` config overrides.
 - **History repair** — before each request the conversation is passed through pi-ai's `transformMessages`, the same pre-pass pi's built-in providers use. Aborted turns with unanswered tool calls get a synthetic error result, and empty assistant turns are dropped, so an interrupted session keeps working.
-- **Reasoning output** — on the OpenAI-compatible route, `reasoning_content` / `reasoning` deltas (DeepSeek, Kimi, and similar) are surfaced as thinking blocks in pi.
+- **Reasoning control** — Azure Foundry defaults to *no* reasoning on the OpenAI-compatible route unless `reasoning_effort` is sent, and model families disagree on which values they accept. The extension maps pi's thinking level through the catalog's per-model `thinkingLevelMap`: the level is clamped to one the model supports, then sent as `reasoning_effort`. When thinking is off, a model whose map says `off → "none"` gets `"none"`; any other model gets no field at all, which avoids a 400 on models that reject `"none"`. Models the catalog marks as not accepting `reasoning_effort` (Kimi) never receive it and reason by default. Override `thinkingLevelMap` or `supportsReasoningEffort` per model in the `models` config if a deployment behaves differently.
+- **Reasoning output** — on the OpenAI-compatible route, `reasoning_content` / `reasoning` / `reasoning_text` deltas (DeepSeek, Kimi, and similar) are surfaced as thinking blocks in pi. DeepSeek also gets `reasoning_content` replayed on prior assistant turns, which it requires once thinking is on.
+- **Output cap** — on the OpenAI-compatible route no `max_tokens` / `max_completion_tokens` is sent unless the caller sets one, matching pi's built-in OpenAI provider. Some catalog `maxTokens` values equal the full context window (Kimi), and Azure rejects `input + max_tokens > window` with a 400. The Anthropic route always sends `max_tokens` because that API requires it.
 - **History repair** — before each request the conversation is passed through pi-ai's `transformMessages`, the same pre-pass pi's built-in providers use. Aborted turns with unanswered tool calls get a synthetic error result, and empty assistant turns are dropped, so an interrupted session keeps working.
 - **Reasoning output** — on the OpenAI-compatible route, `reasoning_content` / `reasoning` deltas (DeepSeek, Kimi, and similar) are surfaced as thinking blocks in pi.
 - **Auth headers** — API key auth sends `api-key: <key>` on the OpenAI route and `Authorization: Bearer <key>` on the Anthropic route. Azure identity sends `Authorization: Bearer <entra-token>` on both. Tokens are cached and refreshed automatically 5 minutes before expiry.
@@ -166,7 +168,11 @@ The `models` section lets you override any subset of the resolved metadata for a
         "cacheRead": 0.19,
         "cacheWrite": 0
       },
-      "openaiTokenLimit": "max_tokens"
+      "openaiTokenLimit": "max_tokens",
+      "supportsReasoningEffort": false
+    },
+    "grok-4.6": {
+      "thinkingLevelMap": { "off": null, "low": "low", "medium": "medium", "high": "high" }
     }
   }
 }
@@ -182,6 +188,8 @@ Supported override fields:
 | `input` | `["text"]`, `["text", "image"]`, etc. | Supported input modalities |
 | `cost` | `{ input, output, cacheRead?, cacheWrite? }` | Per-1M-token pricing in USD |
 | `openaiTokenLimit` | `"max_tokens"` or `"max_completion_tokens"` | Which field pi sends for the output token limit |
+| `thinkingLevelMap` | `{ off?, minimal?, low?, medium?, high?, xhigh?, max? }` → string or `null` | pi thinking level → wire `reasoning_effort`. `null` hides a level. A string under `off` (e.g. `"none"`) is sent when thinking is off; `null`/absent sends nothing |
+| `supportsReasoningEffort` | boolean | Set `false` for models that reject or ignore `reasoning_effort` (the field is then never sent) |
 
 Common use-cases include fixing stale data in the `pi-ai` catalog, setting custom parameters configured in Foundry (e.g. `maxTokens`), or ensuring cost estimates reflect special pricing from a negotiated arrangement with Microsoft Azure.
 
