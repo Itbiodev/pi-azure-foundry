@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `gatewayUrl` config option to route chat requests through an API Management gateway.
 - `headers` config option to send extra HTTP headers on every chat request.
 - Reasoning deltas (`reasoning_content`, `reasoning`, `reasoning_text`) on the OpenAI-compatible route are surfaced as thinking blocks.
-- Converter regression tests (`npm test`).
+- Offline test suites (`npm test`): converter regression tests and an end-to-end suite with a fake pi host and mocked `fetch`.
+- GitHub Actions CI running type-check and tests on Node 22 and 24.
 
 ### Fixed
 - Sessions no longer break permanently after an interrupted turn. Histories now pass through pi-ai's `transformMessages` before conversion, which adds synthetic results for unanswered tool calls and drops empty assistant turns.

@@ -197,7 +197,20 @@ Common use-cases include fixing stale data in the `pi-ai` catalog, setting custo
 
 ## Development
 
-Run `npm test` to build and run the converter regression tests.
+### Testing
+
+`npm test` builds the extension and runs two offline suites. No Azure account is needed.
+
+- `test/converters.test.mjs` — message conversion for both routes: interrupted turns, unanswered tool calls, empty thinking blocks, tool-call-only turns, and multi-tool turns.
+- `test/extension.test.mjs` — loads the built extension with a fake pi host and a mocked `fetch`. It covers deployment discovery, catalog / override / fallback metadata resolution, route selection and token-limit field, gateway URL and header precedence, SSE parsing across chunk boundaries, streaming of text, reasoning, and tool calls on both routes, usage and cost, and error handling.
+
+CI runs both suites on Node 22 and 24 for every pull request.
+
+Before each release the extension is also checked against a live Azure AI Foundry project through pi in non-interactive mode. The last check ran on pi 0.78.0 against seven deployments (Claude, GPT, Kimi, and DeepSeek) and covered a plain reply plus a tool-call round trip on both the Anthropic and the OpenAI-compatible route:
+
+```bash
+pi -ne -e ./dist/index.js -p --no-session --model azure-foundry/<deployment> "Reply with exactly the word OK."
+```
 
 ```bash
 git clone https://github.com/nquandt/pi-azure-foundry

@@ -43,7 +43,7 @@
     "clean": "rm -rf dist",
     "prebuild": "npm run clean",
     "type-check": "tsc --noEmit",
-    "test": "npm run build && node test/converters.test.mjs"
+    "test": "npm run build && node test/converters.test.mjs && node test/extension.test.mjs"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.84.4",
