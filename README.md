@@ -86,6 +86,24 @@ No key needed. Uses [`DefaultAzureCredential`](https://learn.microsoft.com/en-us
 
 For local development, `az login` is the easiest option.
 
+### Gateway and extra headers (optional)
+
+If your organization fronts Azure AI Foundry with an API Management gateway, set `gatewayUrl`. Chat requests then go to that host with the same route paths (`/openai/deployments/...` and `/anthropic/v1/messages`). Deployment discovery still uses the Foundry endpoint directly.
+
+Use `headers` to send extra HTTP headers on every chat request, for example an APIM subscription key. The extension's own auth headers always take precedence over these.
+
+```json
+{
+  "resourceId": "my-resource-eastus2",
+  "projectId": "my-project-eastus2",
+  "auth": { "type": "azure-identity" },
+  "gatewayUrl": "https://my-gateway.azure-api.net/foundry",
+  "headers": {
+    "Ocp-Apim-Subscription-Key": "your-subscription-key"
+  }
+}
+```
+
 ---
 
 ## Usage
@@ -110,6 +128,10 @@ Your deployments will appear in the pi model picker under the **Azure Foundry** 
 - **Metadata resolution** — model details (context window, max output tokens, reasoning support, vision support, and per-token pricing) are resolved by matching the Azure catalog model name against [pi-ai](https://npmjs.com/package/@earendil-works/pi-ai)'s built-in model providers. The match is case-insensitive, so `Kimi-K2.7-Code` resolves to pi-ai's `kimi-k2.7-code`.
 - **Config overrides** — you can pin or override details for any catalog model via the optional `models` property in `azure-foundry.config.json`. This takes precedence over the pi-ai catalog lookup and is useful for custom deployments, negotiated pricing, or models not yet in pi-ai. See the example below.
 - **Routing** — Anthropic deployments are routed to `/anthropic/v1/messages` (native Messages API with tool use and extended thinking). All other deployments use `/openai/deployments/{id}/chat/completions` (OpenAI-compatible). Newer GPT-5/o-series models use `max_completion_tokens` instead of `max_tokens`; this is inferred from model name or set explicitly in `models` config overrides.
+- **History repair** — before each request the conversation is passed through pi-ai's `transformMessages`, the same pre-pass pi's built-in providers use. Aborted turns with unanswered tool calls get a synthetic error result, and empty assistant turns are dropped, so an interrupted session keeps working.
+- **Reasoning output** — on the OpenAI-compatible route, `reasoning_content` / `reasoning` deltas (DeepSeek, Kimi, and similar) are surfaced as thinking blocks in pi.
+- **History repair** — before each request the conversation is passed through pi-ai's `transformMessages`, the same pre-pass pi's built-in providers use. Aborted turns with unanswered tool calls get a synthetic error result, and empty assistant turns are dropped, so an interrupted session keeps working.
+- **Reasoning output** — on the OpenAI-compatible route, `reasoning_content` / `reasoning` deltas (DeepSeek, Kimi, and similar) are surfaced as thinking blocks in pi.
 - **Auth headers** — API key auth sends `api-key: <key>` on the OpenAI route and `Authorization: Bearer <key>` on the Anthropic route. Azure identity sends `Authorization: Bearer <entra-token>` on both. Tokens are cached and refreshed automatically 5 minutes before expiry.
 
 ---
@@ -174,6 +196,8 @@ Common use-cases include fixing stale data in the `pi-ai` catalog, setting custo
 ---
 
 ## Development
+
+Run `npm test` to build and run the converter regression tests.
 
 ```bash
 git clone https://github.com/nquandt/pi-azure-foundry

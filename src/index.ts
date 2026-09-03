@@ -37,6 +37,7 @@ import { DEEPSEEK_MODELS } from "@earendil-works/pi-ai/providers/deepseek.models
 import { XAI_MODELS } from "@earendil-works/pi-ai/providers/xai.models";
 import { MOONSHOTAI_MODELS } from "@earendil-works/pi-ai/providers/moonshotai.models";
 import { MOONSHOTAI_CN_MODELS } from "@earendil-works/pi-ai/providers/moonshotai-cn.models";
+import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { homedir } from "node:os";
@@ -66,6 +67,18 @@ interface Config {
   projectId: string;
   auth: AuthConfig;
   models?: Record<string, ModelConfigOverride>;
+  /**
+   * Optional gateway base URL (e.g. an Azure API Management front door such as
+   * https://my-gw.azure-api.net/foundry). When set, chat requests are sent to
+   * this host instead of the Foundry endpoint. Deployment discovery still uses
+   * the Foundry endpoint. The same route paths are appended in both cases.
+   */
+  gatewayUrl?: string;
+  /**
+   * Optional extra HTTP headers sent on every chat request (e.g. an APIM
+   * subscription key). Auth headers set by the extension always take precedence.
+   */
+  headers?: Record<string, string>;
 }
 
 // =============================================================================
@@ -263,6 +276,10 @@ function describeApiRoute(route: ApiRoute): string {
 interface ProviderAuth {
   type: AuthConfig["type"];
   getToken: () => Promise<string>;
+  /** Host to send chat requests to. Defaults to the Foundry endpoint origin. */
+  gatewayUrl?: string;
+  /** Extra headers applied to every chat request, below the auth headers. */
+  headers: Record<string, string>;
 }
 const providerAuthMap = new Map<string, ProviderAuth>();
 
@@ -345,7 +362,9 @@ function toOpenAIMessages(systemPrompt: string | undefined, messages: Message[])
       const tcs = msg.content.filter((b) => b.type === "toolCall").map((b) => ({
         id: (b as any).id, type: "function", function: { name: (b as any).name, arguments: JSON.stringify((b as any).arguments) },
       }));
-      if (text) entry.content = text;
+      // Always a string: Azure rejects a null/absent content on an assistant
+      // turn, which a tool-call-only turn would otherwise produce.
+      entry.content = text;
       if (tcs.length) entry.tool_calls = tcs;
       out.push(entry);
     } else if (msg.role === "toolResult") {
@@ -382,15 +401,27 @@ function toAnthropicMessages(messages: Message[]): unknown[] {
       const blocks: unknown[] = [];
       for (const b of msg.content) {
         if (b.type === "text" && (b as TextContent).text.trim()) blocks.push({ type: "text", text: (b as TextContent).text });
-        if (b.type === "thinking") blocks.push({ type: "thinking", thinking: (b as ThinkingContent).thinking, signature: (b as ThinkingContent).thinkingSignature ?? "" });
+        // Anthropic rejects a thinking block with empty text, and one with a
+        // missing signature. Replay only blocks that have both.
+        if (b.type === "thinking") {
+          const t = b as ThinkingContent;
+          if (t.thinking.trim() && t.thinkingSignature) blocks.push({ type: "thinking", thinking: t.thinking, signature: t.thinkingSignature });
+        }
         if (b.type === "toolCall") blocks.push({ type: "tool_use", id: (b as any).id, name: (b as any).name, input: (b as any).arguments });
       }
       if (blocks.length) out.push({ role: "assistant", content: blocks });
     } else if (msg.role === "toolResult") {
       const m = msg as ToolResultMessage;
       const text = m.content.filter((c): c is TextContent => c.type === "text").map((c) => c.text).join("\n");
-      // Anthropic tool results go inside a user message
-      out.push({ role: "user", content: [{ type: "tool_result", tool_use_id: m.toolCallId, content: text, is_error: m.isError }] });
+      // Anthropic tool results go inside a user message, and every result for a
+      // turn must sit in the single user message that follows it. Merge
+      // consecutive results into one message instead of emitting one each.
+      const block = { type: "tool_result", tool_use_id: m.toolCallId, content: text, is_error: m.isError };
+      const prev = out[out.length - 1] as { role?: string; content?: unknown[] } | undefined;
+      const prevIsResults = prev?.role === "user" && Array.isArray(prev.content) && prev.content.length > 0
+        && prev.content.every((c) => (c as { type?: string }).type === "tool_result");
+      if (prevIsResults) prev!.content!.push(block);
+      else out.push({ role: "user", content: [block] });
     }
   }
   return out;
@@ -413,10 +444,10 @@ function streamOpenAI(
   baseHost: string, auth: ProviderAuth, route: Extract<ApiRoute, { kind: "openai-chat-completions" }>,
 ): Promise<void> {
   return (async () => {
-    const url = `${baseHost}/openai/deployments/${model.id}/chat/completions?api-version=2024-10-21`;
+    const url = `${auth.gatewayUrl ?? baseHost}/openai/deployments/${model.id}/chat/completions?api-version=2024-10-21`;
     const maxOutput = options?.maxTokens ?? model.maxTokens;
     const body: Record<string, unknown> = {
-      messages: toOpenAIMessages(context.systemPrompt, context.messages),
+      messages: toOpenAIMessages(context.systemPrompt, transformMessages(context.messages, model)),
       [route.tokenLimit]: maxOutput,
       stream: true,
       stream_options: { include_usage: true },
@@ -432,7 +463,7 @@ function streamOpenAI(
         : { "Authorization": `Bearer ${token}` };
     const response = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json", ...authHeaders },
+      headers: { "Content-Type": "application/json", ...auth.headers, ...authHeaders },
       body: JSON.stringify(body),
       signal: options?.signal,
     });
@@ -463,7 +494,18 @@ function streamOpenAI(
       if (!choice?.delta) continue;
       const delta = choice.delta;
 
-      if (typeof delta.content === "string") {
+      // Reasoning deltas: DeepSeek/Kimi use `reasoning_content`, other
+      // OpenAI-compatible endpoints use `reasoning` or `reasoning_text`.
+      // Surface them as a thinking block, same as pi-ai's own OpenAI provider.
+      const reasoningDelta = [delta.reasoning_content, delta.reasoning, delta.reasoning_text]
+        .find((r): r is string => typeof r === "string" && r.length > 0);
+      if (reasoningDelta) {
+        let idx = output.content.findIndex((b) => b.type === "thinking");
+        if (idx === -1) { output.content.push({ type: "thinking", thinking: "" } as ThinkingContent); idx = output.content.length - 1; stream.push({ type: "thinking_start", contentIndex: idx, partial: output }); }
+        const block = output.content[idx]; if (block.type === "thinking") { (block as ThinkingContent).thinking += reasoningDelta; stream.push({ type: "thinking_delta", contentIndex: idx, delta: reasoningDelta, partial: output }); }
+      }
+
+      if (typeof delta.content === "string" && delta.content.length > 0) {
         let idx = output.content.findIndex((b) => b.type === "text");
         if (idx === -1) { output.content.push({ type: "text", text: "" }); idx = output.content.length - 1; stream.push({ type: "text_start", contentIndex: idx, partial: output }); }
         const block = output.content[idx]; if (block.type === "text") { block.text += delta.content; stream.push({ type: "text_delta", contentIndex: idx, delta: delta.content, partial: output }); }
@@ -492,7 +534,11 @@ function streamOpenAI(
     }
 
     // Finalize blocks
-    for (let i = 0; i < output.content.length; i++) { if (output.content[i].type === "text") stream.push({ type: "text_end", contentIndex: i, content: (output.content[i] as TextContent).text, partial: output }); }
+    for (let i = 0; i < output.content.length; i++) {
+      const b = output.content[i];
+      if (b.type === "text") stream.push({ type: "text_end", contentIndex: i, content: (b as TextContent).text, partial: output });
+      else if (b.type === "thinking") stream.push({ type: "thinking_end", contentIndex: i, content: (b as ThinkingContent).thinking, partial: output });
+    }
     for (const [tci, ci] of tcContentIdx) { const b = output.content[ci]; if (b.type === "toolCall") { try { b.arguments = JSON.parse(tcJsonBufs.get(tci) ?? "{}"); } catch {} stream.push({ type: "toolcall_end", contentIndex: ci, toolCall: b, partial: output }); } }
   })();
 }
@@ -507,10 +553,10 @@ function streamAnthropic(
   baseHost: string, auth: ProviderAuth,
 ): Promise<void> {
   return (async () => {
-    const url = `${baseHost}/anthropic/v1/messages`;
+    const url = `${auth.gatewayUrl ?? baseHost}/anthropic/v1/messages`;
     const body: Record<string, unknown> = {
       model: model.id,
-      messages: toAnthropicMessages(context.messages),
+      messages: toAnthropicMessages(transformMessages(context.messages, model)),
       max_tokens: options?.maxTokens ?? model.maxTokens,
       stream: true,
     };
@@ -524,6 +570,7 @@ function streamAnthropic(
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        ...auth.headers,
         "Authorization": `Bearer ${token}`,
         "anthropic-version": "2023-06-01",
       },
@@ -651,7 +698,7 @@ function streamAzureFoundry(
       const route = apiRouteMap.get(model.id) ?? { kind: "openai-chat-completions", tokenLimit: "max_tokens" };
       // Resolve auth: use registered provider auth, fall back to api-key from options.
       const auth: ProviderAuth = providerAuthMap.get(model.provider)
-        ?? { type: "api-key", getToken: () => Promise.resolve(options?.apiKey ?? "") };
+        ?? { type: "api-key", getToken: () => Promise.resolve(options?.apiKey ?? ""), headers: {} };
 
       if (route.kind === "anthropic-messages") {
         await streamAnthropic(model, context, options, output, stream, baseHost, auth);
@@ -706,7 +753,11 @@ export default async function (pi: ExtensionAPI) {
 
   const providerId = "azure-foundry";
   // Store the auth context so streamAzureFoundry can build the right headers per-request.
-  providerAuthMap.set(providerId, { type: config.auth.type, getToken });
+  const gatewayUrl = config.gatewayUrl?.replace(/\/+$/, "") || undefined;
+  if (gatewayUrl) console.log(`[Azure Foundry] Chat requests routed through gateway: ${gatewayUrl}`);
+  const headers = config.headers ?? {};
+  if (Object.keys(headers).length) console.log(`[Azure Foundry] Extra request headers: ${Object.keys(headers).join(", ")}`);
+  providerAuthMap.set(providerId, { type: config.auth.type, getToken, gatewayUrl, headers });
 
   pi.registerProvider(providerId, {
     name: "Azure Foundry",
@@ -722,3 +773,6 @@ export default async function (pi: ExtensionAPI) {
 
   console.log(`[Azure Foundry] ✓ Registered ${deployments.length} model(s)`);
 }
+
+// Exported for tests only.
+export { toOpenAIMessages, toAnthropicMessages };
