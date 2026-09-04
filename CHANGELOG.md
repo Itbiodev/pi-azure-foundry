@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions CI running type-check and tests on Node 22 and 24.
 
 ### Fixed
+- Both routes now accept a system prompt given as a string array and bare strings inside user content arrays, as some pi forks (OMP) send. Previously the OpenAI route returned a 400 and the bare strings were dropped.
 - Reasoning is now actually enabled on the OpenAI-compatible route. Foundry defaults to no reasoning unless `reasoning_effort` is sent; pi's thinking level is now clamped and mapped through the catalog's per-model `thinkingLevelMap`. Models that reject `"none"` get no field when thinking is off, and models that do not accept the field (Kimi) never receive it.
 - No output cap is sent on the OpenAI-compatible route unless the caller sets one. Catalog `maxTokens` values that equal the context window (Kimi) caused a 400 on every request.
 - DeepSeek gets `reasoning_content` replayed on assistant turns, which it requires once thinking is on.

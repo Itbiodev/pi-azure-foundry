@@ -391,14 +391,33 @@ async function* parseSSE(reader: ReadableStreamDefaultReader<Uint8Array>): Async
 }
 
 // =============================================================================
+// Shared conversion helpers
+// =============================================================================
+
+/**
+ * pi passes systemPrompt as a string. Some pi forks (OMP) pass a string array.
+ * Collapse to one string so neither route forwards a shape the API rejects.
+ */
+function normalizeSystemPrompt(sp: unknown): string | undefined {
+  if (Array.isArray(sp)) { const joined = sp.filter((x) => typeof x === "string" && x).join("\n"); return joined || undefined; }
+  return typeof sp === "string" && sp ? sp : undefined;
+}
+
+/** Some hosts put bare strings inside user content arrays; treat them as text blocks. */
+function asTextIfString(c: unknown): { type: "text"; text: string } | undefined {
+  return typeof c === "string" ? { type: "text", text: c } : undefined;
+}
+
+// =============================================================================
 // OpenAI-format message conversion  (for OpenAI / MoonshotAI / etc.)
 // =============================================================================
 
 function toOpenAIMessages(
-  systemPrompt: string | undefined, messages: Message[], opts: { replayReasoningContent?: boolean } = {},
+  systemPrompt: string | string[] | undefined, messages: Message[], opts: { replayReasoningContent?: boolean } = {},
 ): unknown[] {
   const out: unknown[] = [];
-  if (systemPrompt) out.push({ role: "system", content: systemPrompt });
+  const sys = normalizeSystemPrompt(systemPrompt);
+  if (sys) out.push({ role: "system", content: sys });
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
@@ -407,9 +426,10 @@ function toOpenAIMessages(
         out.push({ role: "user", content: msg.content });
       } else {
         out.push({ role: "user", content: msg.content.map((c) =>
-          c.type === "text"  ? { type: "text", text: (c as TextContent).text } :
+          asTextIfString(c) ??
+          (c.type === "text"  ? { type: "text", text: (c as TextContent).text } :
           c.type === "image" ? { type: "image_url", image_url: { url: `data:${(c as ImageContent).mimeType};base64,${(c as ImageContent).data}` } } :
-          { type: "text", text: "" }
+          { type: "text", text: "" })
         )});
       }
     } else if (msg.role === "assistant") {
@@ -453,9 +473,10 @@ function toAnthropicMessages(messages: Message[]): unknown[] {
         out.push({ role: "user", content: msg.content });
       } else {
         out.push({ role: "user", content: msg.content.map((c) =>
-          c.type === "text" ? { type: "text", text: (c as TextContent).text } :
+          asTextIfString(c) ??
+          (c.type === "text" ? { type: "text", text: (c as TextContent).text } :
           c.type === "image" ? { type: "image", source: { type: "base64", media_type: (c as ImageContent).mimeType, data: (c as ImageContent).data } } :
-          { type: "text", text: "" }
+          { type: "text", text: "" })
         )});
       }
     } else if (msg.role === "assistant") {
@@ -625,7 +646,8 @@ function streamAnthropic(
       max_tokens: options?.maxTokens ?? model.maxTokens,
       stream: true,
     };
-    if (context.systemPrompt) body.system = context.systemPrompt;
+    const sys = normalizeSystemPrompt(context.systemPrompt);
+    if (sys) body.system = sys;
     if (context.tools?.length) body.tools = toAnthropicTools(context.tools);
 
     const token = await auth.getToken();

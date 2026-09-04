@@ -243,6 +243,28 @@ console.log("anthropic route: request shape and streaming");
   check("usage incl. cache read, stopReason toolUse", message.usage.input === 20 && message.usage.cacheRead === 3 && message.usage.output === 7 && message.stopReason === "toolUse", JSON.stringify(message.usage));
 }
 
+console.log("host tolerance: array system prompt and bare-string content items");
+{
+  nextChat = { sse: [{ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }, "[DONE]"] };
+  let before = requests.length;
+  await run("gpt-5-mini", { systemPrompt: ["part one", "", "part two"], messages: [{ role: "user", content: ["hello", { type: "text", text: "world" }] }] }, {});
+  let body = JSON.parse(requests[before].init.body);
+  check("openai: array system prompt collapsed to a string", body.messages[0].role === "system" && body.messages[0].content === "part one\npart two", JSON.stringify(body.messages[0]));
+  check("openai: bare string in content array kept as text", body.messages[1].content[0].text === "hello" && body.messages[1].content[1].text === "world", JSON.stringify(body.messages[1]));
+  nextChat = { sse: [
+    { type: "message_start", message: { usage: { input_tokens: 1 } } },
+    { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+    { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } },
+    { type: "content_block_stop", index: 0 },
+    { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
+  ] };
+  before = requests.length;
+  await run("claude-haiku-4-5", { systemPrompt: ["a", "b"], messages: [{ role: "user", content: ["hello"] }] }, {});
+  body = JSON.parse(requests[before].init.body);
+  check("anthropic: array system prompt collapsed to a string", body.system === "a\nb", JSON.stringify(body.system));
+  check("anthropic: bare string in content array kept as text", body.messages[0].content[0].text === "hello", JSON.stringify(body.messages[0]));
+}
+
 console.log("error handling");
 {
   nextChat = { status: 429 };
