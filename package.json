@@ -9,7 +9,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/nquandt/pi-azure-foundry.git"
+    "url": "https://github.com/Itbiodev/pi-azure-foundry.git"
   },
   "keywords": [
     "pi",
@@ -42,13 +42,16 @@
     "dev": "tsc --watch",
     "clean": "rm -rf dist",
     "prebuild": "npm run clean",
+    "prepare": "npm run build",
+    "test": "vitest run",
     "type-check": "tsc --noEmit"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "^0.80.6",
     "@earendil-works/pi-coding-agent": "^0.80.6",
     "@types/node": "^20",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^3.2.7"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
@@ -64,5 +67,8 @@
   "dependencies": {
     "@azure/identity": "^4.13.1",
     "@earendil-works/pi-ai": "^0.80.6"
-  }
+  },
+  "bundleDependencies": [
+    "@azure/identity"
+  ]
 }
