@@ -4,7 +4,8 @@
  * Discovers models from Azure AI Foundry Deployments API and registers them with pi.
  * Routes to the correct API based on model publisher:
  *   - Anthropic → native Messages API at /anthropic/v1/messages
- *   - OpenAI/others → OpenAI-compat at /openai/deployments/{id}/chat/completions
+ *   - GPT-6+ → OpenAI Responses API at /openai/v1/responses
+ *   - Other OpenAI-compatible models → /openai/deployments/{id}/chat/completions
  *
  * Config: ./azure-foundry.config.json
  */
@@ -51,6 +52,7 @@ type AuthConfig =
   | { type: "azure-identity" };
 
 type OpenAITokenLimitParam = "max_tokens" | "max_completion_tokens";
+type OpenAIRouteOverride = "responses" | "chat-completions";
 
 interface ModelConfigOverride {
   contextWindow?: number;
@@ -59,6 +61,8 @@ interface ModelConfigOverride {
   input?: ("text" | "image")[];
   cost?: ModelCost;
   openaiTokenLimit?: OpenAITokenLimitParam;
+  /** Force this model onto the Responses or legacy chat-completions route. */
+  openaiRoute?: OpenAIRouteOverride;
 }
 
 interface Config {
@@ -140,6 +144,7 @@ interface ResolvedModelDetails {
   cost: ModelCost;
   thinkingLevelMap?: Model<Api>["thinkingLevelMap"];
   openaiTokenLimit?: OpenAITokenLimitParam;
+  openaiRoute?: OpenAIRouteOverride;
   source: "config" | "catalog" | "fallback";
 }
 
@@ -234,8 +239,9 @@ function resolveModelDetails(
 }
 
 /** Per-deployment API route resolved at discovery time */
-type ApiRoute =
+export type ApiRoute =
   | { kind: "anthropic-messages" }
+  | { kind: "openai-responses" }
   | { kind: "openai-chat-completions"; tokenLimit: OpenAITokenLimitParam };
 
 const apiRouteMap = new Map<string, ApiRoute>();
@@ -248,14 +254,23 @@ function inferOpenAITokenLimit(modelName: string, resolved: ResolvedModelDetails
   return "max_tokens";
 }
 
-function resolveApiRoute(d: Deployment, resolved: ResolvedModelDetails): ApiRoute {
+function isGpt6Plus(modelName: string): boolean {
+  return /^gpt-(?:[6-9]|[1-9][0-9])(?:[-.]|$)/i.test(modelName);
+}
+
+export function resolveApiRoute(d: Deployment, resolved: ResolvedModelDetails): ApiRoute {
   if (d.modelPublisher === "Anthropic") return { kind: "anthropic-messages" };
+  if (resolved.openaiRoute === "responses") return { kind: "openai-responses" };
   const modelName = d.modelName ?? d.name;
+  if (resolved.openaiRoute !== "chat-completions" && isGpt6Plus(modelName)) {
+    return { kind: "openai-responses" };
+  }
   return { kind: "openai-chat-completions", tokenLimit: inferOpenAITokenLimit(modelName, resolved) };
 }
 
 function describeApiRoute(route: ApiRoute): string {
   if (route.kind === "anthropic-messages") return "anthropic-messages";
+  if (route.kind === "openai-responses") return "openai-responses";
   return `openai-chat-completions (${route.tokenLimit})`;
 }
 
@@ -272,7 +287,19 @@ function deploymentToModel(
   overrides: Record<string, ModelConfigOverride> | undefined,
 ) {
   const modelName = d.modelName ?? d.name;
-  const details = resolveModelDetails(modelName, catalog, overrides);
+  let details = resolveModelDetails(modelName, catalog, overrides);
+  // GPT-6 deployments predate their pi-ai catalog entries. Avoid presenting them
+  // as non-reasoning 4K models while still allowing every field to be overridden.
+  if (isGpt6Plus(modelName)) {
+    const hasCatalogEntry = catalog.has(normalizeModelName(modelName));
+    details = {
+      ...details,
+      contextWindow: overrides?.[modelName]?.contextWindow ?? (hasCatalogEntry ? details.contextWindow : 1_000_000),
+      maxTokens: overrides?.[modelName]?.maxTokens ?? (hasCatalogEntry ? details.maxTokens : 128_000),
+      reasoning: overrides?.[modelName]?.reasoning ?? true,
+      thinkingLevelMap: details.thinkingLevelMap ?? { off: null, minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "xhigh" },
+    };
+  }
   apiRouteMap.set(d.name, resolveApiRoute(d, details));
 
   const model = {
@@ -299,7 +326,7 @@ function deploymentToModel(
 // SSE Stream Parser
 // =============================================================================
 
-async function* parseSSE(reader: ReadableStreamDefaultReader<Uint8Array>): AsyncGenerator<string> {
+export async function* parseSSE(reader: ReadableStreamDefaultReader<Uint8Array>): AsyncGenerator<string> {
   const decoder = new TextDecoder();
   let buffer = "";
   while (true) {
@@ -358,6 +385,44 @@ function toOpenAIMessages(systemPrompt: string | undefined, messages: Message[])
 
 function toOpenAITools(tools: Tool[]): unknown[] {
   return tools.map((t) => ({ type: "function", function: { name: t.name, description: t.description, parameters: t.parameters } }));
+}
+
+// =============================================================================
+// OpenAI Responses-format conversion
+// =============================================================================
+
+export function toResponsesInput(systemPrompt: string | undefined, messages: Message[]): unknown[] {
+  const input: unknown[] = [];
+  if (systemPrompt) input.push({ role: "developer", content: [{ type: "input_text", text: systemPrompt }] });
+  for (const msg of messages) {
+    if (msg.role === "user") {
+      const content = typeof msg.content === "string"
+        ? [{ type: "input_text", text: msg.content }]
+        : msg.content.map((c) => c.type === "image"
+          ? { type: "input_image", detail: "auto", image_url: `data:${(c as ImageContent).mimeType};base64,${(c as ImageContent).data}` }
+          : { type: "input_text", text: (c as TextContent).text });
+      input.push({ role: "user", content });
+    } else if (msg.role === "assistant") {
+      for (const block of msg.content) {
+        if (block.type === "thinking" && block.thinkingSignature) {
+          try { input.push(JSON.parse(block.thinkingSignature)); } catch { /* only replay valid opaque response items */ }
+        } else if (block.type === "text") {
+          input.push({ role: "assistant", content: [{ type: "output_text", text: block.text }] });
+        } else if (block.type === "toolCall") {
+          const [callId, itemId] = block.id.split("|");
+          input.push({ type: "function_call", ...(itemId ? { id: itemId } : {}), call_id: callId, name: block.name, arguments: JSON.stringify(block.arguments) });
+        }
+      }
+    } else if (msg.role === "toolResult") {
+      const text = msg.content.filter((c): c is TextContent => c.type === "text").map((c) => c.text).join("\n");
+      input.push({ type: "function_call_output", call_id: msg.toolCallId.split("|")[0], output: text || "(no tool output)" });
+    }
+  }
+  return input;
+}
+
+export function toResponsesTools(tools: Tool[]): unknown[] {
+  return tools.map((t) => ({ type: "function", name: t.name, description: t.description, parameters: t.parameters, strict: false }));
 }
 
 // =============================================================================
@@ -494,6 +559,94 @@ function streamOpenAI(
     // Finalize blocks
     for (let i = 0; i < output.content.length; i++) { if (output.content[i].type === "text") stream.push({ type: "text_end", contentIndex: i, content: (output.content[i] as TextContent).text, partial: output }); }
     for (const [tci, ci] of tcContentIdx) { const b = output.content[ci]; if (b.type === "toolCall") { try { b.arguments = JSON.parse(tcJsonBufs.get(tci) ?? "{}"); } catch {} stream.push({ type: "toolcall_end", contentIndex: ci, toolCall: b, partial: output }); } }
+  })();
+}
+
+// =============================================================================
+// OpenAI Responses API streaming
+// =============================================================================
+
+export async function processResponsesEvents(
+  events: AsyncIterable<string>, model: Model<Api>, output: AssistantMessage,
+  stream: ReturnType<typeof createAssistantMessageEventStream>,
+): Promise<void> {
+  const slots = new Map<number, { contentIndex: number; json?: string }>();
+  let terminal = false;
+  for await (const data of events) {
+    let event: any;
+    try { event = JSON.parse(data); } catch { continue; }
+    if (event.type === "response.output_item.added") {
+      const item = event.item;
+      if (item.type === "reasoning") {
+        output.content.push({ type: "thinking", thinking: "" });
+        slots.set(event.output_index, { contentIndex: output.content.length - 1 });
+        stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
+      } else if (item.type === "message") {
+        output.content.push({ type: "text", text: "" });
+        slots.set(event.output_index, { contentIndex: output.content.length - 1 });
+        stream.push({ type: "text_start", contentIndex: output.content.length - 1, partial: output });
+      } else if (item.type === "function_call") {
+        output.content.push({ type: "toolCall", id: `${item.call_id}|${item.id}`, name: item.name, arguments: {} });
+        slots.set(event.output_index, { contentIndex: output.content.length - 1, json: item.arguments ?? "" });
+        stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
+      }
+    } else if (event.type === "response.reasoning_summary_text.delta" || event.type === "response.reasoning_text.delta") {
+      const slot = slots.get(event.output_index); const block = slot && output.content[slot.contentIndex];
+      if (slot && block?.type === "thinking") { block.thinking += event.delta; stream.push({ type: "thinking_delta", contentIndex: slot.contentIndex, delta: event.delta, partial: output }); }
+    } else if (event.type === "response.output_text.delta" || event.type === "response.refusal.delta") {
+      const slot = slots.get(event.output_index); const block = slot && output.content[slot.contentIndex];
+      if (slot && block?.type === "text") { block.text += event.delta; stream.push({ type: "text_delta", contentIndex: slot.contentIndex, delta: event.delta, partial: output }); }
+    } else if (event.type === "response.function_call_arguments.delta") {
+      const slot = slots.get(event.output_index); const block = slot && output.content[slot.contentIndex];
+      if (slot && block?.type === "toolCall") { slot.json = (slot.json ?? "") + event.delta; try { block.arguments = JSON.parse(slot.json); } catch {} stream.push({ type: "toolcall_delta", contentIndex: slot.contentIndex, delta: event.delta, partial: output }); }
+    } else if (event.type === "response.output_item.done") {
+      const slot = slots.get(event.output_index); if (!slot) continue;
+      const block = output.content[slot.contentIndex]; const item = event.item;
+      if (block.type === "thinking") { block.thinking = item.summary?.map((s: any) => s.text).join("\n\n") || item.content?.map((c: any) => c.text).join("\n\n") || block.thinking; block.thinkingSignature = JSON.stringify(item); stream.push({ type: "thinking_end", contentIndex: slot.contentIndex, content: block.thinking, partial: output }); }
+      else if (block.type === "text") { block.text = item.content?.map((c: any) => c.text ?? c.refusal ?? "").join("") || block.text; stream.push({ type: "text_end", contentIndex: slot.contentIndex, content: block.text, partial: output }); }
+      else if (block.type === "toolCall") { try { block.arguments = JSON.parse(item.arguments || slot.json || "{}"); } catch {} stream.push({ type: "toolcall_end", contentIndex: slot.contentIndex, toolCall: block, partial: output }); }
+      slots.delete(event.output_index);
+    } else if (event.type === "response.completed" || event.type === "response.incomplete") {
+      terminal = true; const response = event.response; const usage = response?.usage;
+      if (response?.id) output.responseId = response.id;
+      if (usage) { const cached = usage.input_tokens_details?.cached_tokens ?? 0; output.usage.input = Math.max(0, (usage.input_tokens ?? 0) - cached); output.usage.cacheRead = cached; output.usage.output = usage.output_tokens ?? 0; output.usage.reasoning = usage.output_tokens_details?.reasoning_tokens ?? 0; output.usage.totalTokens = usage.total_tokens ?? 0; calculateCost(model, output.usage); }
+      output.stopReason = event.type === "response.incomplete" ? "length" : output.content.some((b) => b.type === "toolCall") ? "toolUse" : "stop";
+    } else if (event.type === "error" || event.type === "response.failed") {
+      const err = event.message ?? event.response?.error?.message ?? event.response?.incomplete_details?.reason ?? "unknown Responses API error";
+      throw new Error(err);
+    }
+  }
+  if (!terminal) throw new Error("Azure Foundry Responses stream ended before a terminal event");
+}
+
+export function toResponsesRequest(model: Model<Api>, context: Context, options: SimpleStreamOptions | undefined): Record<string, unknown> {
+  const body: Record<string, unknown> = { model: model.id, input: toResponsesInput(context.systemPrompt, context.messages), stream: true, store: false, max_output_tokens: Math.max(16, options?.maxTokens ?? model.maxTokens) };
+  if (context.tools?.length) body.tools = toResponsesTools(context.tools);
+  if (model.reasoning) {
+    const level = options?.reasoning ?? "medium";
+    const effort = model.thinkingLevelMap?.[level] ?? level;
+    if (effort) {
+      body.reasoning = { effort, summary: "auto" };
+      body.include = ["reasoning.encrypted_content"];
+    }
+  }
+  return body;
+}
+
+function streamResponses(
+  model: Model<Api>, context: Context, options: SimpleStreamOptions | undefined,
+  output: AssistantMessage, stream: ReturnType<typeof createAssistantMessageEventStream>,
+  baseHost: string, auth: ProviderAuth,
+): Promise<void> {
+  return (async () => {
+    const body = toResponsesRequest(model, context, options);
+    const token = await auth.getToken();
+    const authHeaders: Record<string, string> = auth.type === "api-key" ? { "api-key": token } : { Authorization: `Bearer ${token}` };
+    const response = await fetch(`${baseHost}/openai/v1/responses`, { method: "POST", headers: { "Content-Type": "application/json", ...authHeaders }, body: JSON.stringify(body), signal: options?.signal });
+    if (!response.ok) { const text = await response.text().catch(() => ""); throw new Error(`Azure Foundry ${response.status}: ${text.slice(0, 500)}`); }
+    if (!response.body) throw new Error("No response body");
+    stream.push({ type: "start", partial: output });
+    await processResponsesEvents(parseSSE(response.body.getReader()), model, output, stream);
   })();
 }
 
@@ -655,6 +808,8 @@ function streamAzureFoundry(
 
       if (route.kind === "anthropic-messages") {
         await streamAnthropic(model, context, options, output, stream, baseHost, auth);
+      } else if (route.kind === "openai-responses") {
+        await streamResponses(model, context, options, output, stream, baseHost, auth);
       } else {
         await streamOpenAI(model, context, options, output, stream, baseHost, auth, route);
       }

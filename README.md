@@ -16,13 +16,13 @@ Supports both **API key** and **Azure identity** (Managed Identity, Azure CLI, s
 ### Global (works in any project)
 
 ```bash
-pi install npm:@nquandt/pi-azure-foundry
+pi install git:github.com/Itbiodev/pi-azure-foundry
 ```
 
 ### Try without installing
 
 ```bash
-pi -e npm:@nquandt/pi-azure-foundry
+pi -e git:github.com/Itbiodev/pi-azure-foundry
 ```
 
 ---
@@ -109,7 +109,7 @@ Your deployments will appear in the pi model picker under the **Azure Foundry** 
 - **Deployment discovery** — on startup the extension calls the Foundry deployments API and filters to chat-capable deployments. No model list to maintain manually.
 - **Metadata resolution** — model details (context window, max output tokens, reasoning support, vision support, and per-token pricing) are resolved by matching the Azure catalog model name against [pi-ai](https://npmjs.com/package/@earendil-works/pi-ai)'s built-in model providers. The match is case-insensitive, so `Kimi-K2.7-Code` resolves to pi-ai's `kimi-k2.7-code`.
 - **Config overrides** — you can pin or override details for any catalog model via the optional `models` property in `azure-foundry.config.json`. This takes precedence over the pi-ai catalog lookup and is useful for custom deployments, negotiated pricing, or models not yet in pi-ai. See the example below.
-- **Routing** — Anthropic deployments are routed to `/anthropic/v1/messages` (native Messages API with tool use and extended thinking). All other deployments use `/openai/deployments/{id}/chat/completions` (OpenAI-compatible). Newer GPT-5/o-series models use `max_completion_tokens` instead of `max_tokens`; this is inferred from model name or set explicitly in `models` config overrides.
+- **Routing** — Anthropic deployments use `/anthropic/v1/messages`. GPT-6 and newer deployments use the streaming `/openai/v1/responses` API, including reasoning and multi-turn function calls. GPT-5.x, o-series, and other OpenAI-compatible deployments retain `/openai/deployments/{id}/chat/completions`; newer chat models use `max_completion_tokens`. Set `openaiRoute` per model to override the default.
 - **Auth headers** — API key auth sends `api-key: <key>` on the OpenAI route and `Authorization: Bearer <key>` on the Anthropic route. Azure identity sends `Authorization: Bearer <entra-token>` on both. Tokens are cached and refreshed automatically 5 minutes before expiry.
 
 ---
@@ -159,7 +159,8 @@ Supported override fields:
 | `reasoning` | boolean | Whether the model emits reasoning/thinking content |
 | `input` | `["text"]`, `["text", "image"]`, etc. | Supported input modalities |
 | `cost` | `{ input, output, cacheRead?, cacheWrite? }` | Per-1M-token pricing in USD |
-| `openaiTokenLimit` | `"max_tokens"` or `"max_completion_tokens"` | Which field pi sends for the output token limit |
+| `openaiTokenLimit` | `"max_tokens"` or `"max_completion_tokens"` | Which field pi sends for the chat-completions output token limit |
+| `openaiRoute` | `"responses"` or `"chat-completions"` | Override automatic OpenAI API routing |
 
 Common use-cases include fixing stale data in the `pi-ai` catalog, setting custom parameters configured in Foundry (e.g. `maxTokens`), or ensuring cost estimates reflect special pricing from a negotiated arrangement with Microsoft Azure.
 
@@ -176,7 +177,7 @@ Common use-cases include fixing stale data in the `pi-ai` catalog, setting custo
 ## Development
 
 ```bash
-git clone https://github.com/nquandt/pi-azure-foundry
+git clone https://github.com/Itbiodev/pi-azure-foundry
 cd pi-azure-foundry
 npm install
 npm run build
