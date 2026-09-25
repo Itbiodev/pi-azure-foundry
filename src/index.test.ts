@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { processResponsesEvents, resolveApiRoute, toResponsesInput, toResponsesTools } from "./index.js";
+import { processResponsesEvents, resolveApiRoute, toResponsesInput, toResponsesRequest, toResponsesTools } from "./index.js";
 
 const details = { contextWindow: 128000, maxTokens: 8192, reasoning: true, input: ["text"] as ("text" | "image")[], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, source: "fallback" as const };
 
@@ -52,5 +52,44 @@ describe("Responses stream translation", () => {
     expect(output.usage).toMatchObject({ input: 10, output: 5, reasoning: 2, totalTokens: 15 });
     expect(output.stopReason).toBe("toolUse");
     expect(emitted.map((e) => e.type)).toContain("toolcall_end");
+  });
+});
+
+describe("Responses reasoning replay", () => {
+  it("requests encrypted reasoning and replays it on the next stateless turn", async () => {
+    const model: any = { id: "gpt-6-astra", reasoning: true, maxTokens: 128000, thinkingLevelMap: { high: "high" }, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+    const tools = [{ name: "read", description: "Read", parameters: { type: "object" } }] as any;
+    const first = toResponsesRequest(model, { messages: [{ role: "user", content: "inspect it", timestamp: 1 }], tools } as any, { reasoning: "high" } as any);
+    expect(first).toMatchObject({ store: false, reasoning: { effort: "high" }, include: ["reasoning.encrypted_content"] });
+
+    const reasoningItem = { type: "reasoning", id: "rs_1", summary: [{ type: "summary_text", text: "think" }], encrypted_content: "enc_abc" };
+    async function* events() {
+      for (const event of [
+        { type: "response.output_item.added", output_index: 0, item: { type: "reasoning" } },
+        { type: "response.output_item.done", output_index: 0, item: reasoningItem },
+        { type: "response.output_item.added", output_index: 1, item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "read", arguments: "" } },
+        { type: "response.output_item.done", output_index: 1, item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "read", arguments: '{"path":"a.ts"}' } },
+        { type: "response.completed", response: { id: "resp_1" } },
+      ]) yield JSON.stringify(event);
+    }
+    const assistant: any = { role: "assistant", content: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: {} }, stopReason: "stop", timestamp: 2 };
+    await processResponsesEvents(events(), model, assistant, { push: () => {} } as any);
+
+    const second = toResponsesRequest(model, { messages: [
+      { role: "user", content: "inspect it", timestamp: 1 },
+      assistant,
+      { role: "toolResult", toolCallId: "call_1|fc_1", toolName: "read", content: [{ type: "text", text: "contents" }], isError: false, timestamp: 3 },
+    ], tools } as any, { reasoning: "high" } as any);
+    expect((second.input as unknown[]).slice(1)).toEqual([
+      reasoningItem,
+      { type: "function_call", id: "fc_1", call_id: "call_1", name: "read", arguments: '{"path":"a.ts"}' },
+      { type: "function_call_output", call_id: "call_1", output: "contents" },
+    ]);
+  });
+
+  it("omits reasoning includes for non-reasoning models", () => {
+    const body = toResponsesRequest({ id: "m", reasoning: false, maxTokens: 100 } as any, { messages: [] } as any, undefined);
+    expect(body.include).toBeUndefined();
+    expect(body.reasoning).toBeUndefined();
   });
 });

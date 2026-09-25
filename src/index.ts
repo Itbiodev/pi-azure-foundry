@@ -254,11 +254,15 @@ function inferOpenAITokenLimit(modelName: string, resolved: ResolvedModelDetails
   return "max_tokens";
 }
 
+function isGpt6Plus(modelName: string): boolean {
+  return /^gpt-(?:[6-9]|[1-9][0-9])(?:[-.]|$)/i.test(modelName);
+}
+
 export function resolveApiRoute(d: Deployment, resolved: ResolvedModelDetails): ApiRoute {
   if (d.modelPublisher === "Anthropic") return { kind: "anthropic-messages" };
   if (resolved.openaiRoute === "responses") return { kind: "openai-responses" };
   const modelName = d.modelName ?? d.name;
-  if (resolved.openaiRoute !== "chat-completions" && /^gpt-(?:[6-9]|[1-9][0-9])(?:[-.]|$)/i.test(modelName)) {
+  if (resolved.openaiRoute !== "chat-completions" && isGpt6Plus(modelName)) {
     return { kind: "openai-responses" };
   }
   return { kind: "openai-chat-completions", tokenLimit: inferOpenAITokenLimit(modelName, resolved) };
@@ -286,11 +290,12 @@ function deploymentToModel(
   let details = resolveModelDetails(modelName, catalog, overrides);
   // GPT-6 deployments predate their pi-ai catalog entries. Avoid presenting them
   // as non-reasoning 4K models while still allowing every field to be overridden.
-  if (/^gpt-(?:[6-9]|[1-9][0-9])(?:[-.]|$)/i.test(modelName)) {
+  if (isGpt6Plus(modelName)) {
+    const hasCatalogEntry = catalog.has(normalizeModelName(modelName));
     details = {
       ...details,
-      contextWindow: overrides?.[modelName]?.contextWindow ?? (details.source === "fallback" ? 1_000_000 : details.contextWindow),
-      maxTokens: overrides?.[modelName]?.maxTokens ?? (details.source === "fallback" ? 128_000 : details.maxTokens),
+      contextWindow: overrides?.[modelName]?.contextWindow ?? (hasCatalogEntry ? details.contextWindow : 1_000_000),
+      maxTokens: overrides?.[modelName]?.maxTokens ?? (hasCatalogEntry ? details.maxTokens : 128_000),
       reasoning: overrides?.[modelName]?.reasoning ?? true,
       thinkingLevelMap: details.thinkingLevelMap ?? { off: null, minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "xhigh" },
     };
@@ -614,19 +619,27 @@ export async function processResponsesEvents(
   if (!terminal) throw new Error("Azure Foundry Responses stream ended before a terminal event");
 }
 
+export function toResponsesRequest(model: Model<Api>, context: Context, options: SimpleStreamOptions | undefined): Record<string, unknown> {
+  const body: Record<string, unknown> = { model: model.id, input: toResponsesInput(context.systemPrompt, context.messages), stream: true, store: false, max_output_tokens: Math.max(16, options?.maxTokens ?? model.maxTokens) };
+  if (context.tools?.length) body.tools = toResponsesTools(context.tools);
+  if (model.reasoning) {
+    const level = options?.reasoning ?? "medium";
+    const effort = model.thinkingLevelMap?.[level] ?? level;
+    if (effort) {
+      body.reasoning = { effort, summary: "auto" };
+      body.include = ["reasoning.encrypted_content"];
+    }
+  }
+  return body;
+}
+
 function streamResponses(
   model: Model<Api>, context: Context, options: SimpleStreamOptions | undefined,
   output: AssistantMessage, stream: ReturnType<typeof createAssistantMessageEventStream>,
   baseHost: string, auth: ProviderAuth,
 ): Promise<void> {
   return (async () => {
-    const body: Record<string, unknown> = { model: model.id, input: toResponsesInput(context.systemPrompt, context.messages), stream: true, store: false, max_output_tokens: Math.max(16, options?.maxTokens ?? model.maxTokens) };
-    if (context.tools?.length) body.tools = toResponsesTools(context.tools);
-    if (model.reasoning) {
-      const level = options?.reasoning ?? "medium";
-      const effort = model.thinkingLevelMap?.[level] ?? level;
-      if (effort) body.reasoning = { effort, summary: "auto" };
-    }
+    const body = toResponsesRequest(model, context, options);
     const token = await auth.getToken();
     const authHeaders: Record<string, string> = auth.type === "api-key" ? { "api-key": token } : { Authorization: `Bearer ${token}` };
     const response = await fetch(`${baseHost}/openai/v1/responses`, { method: "POST", headers: { "Content-Type": "application/json", ...authHeaders }, body: JSON.stringify(body), signal: options?.signal });

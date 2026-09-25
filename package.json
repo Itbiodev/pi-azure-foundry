@@ -67,8 +67,5 @@
   "dependencies": {
     "@azure/identity": "^4.13.1",
     "@earendil-works/pi-ai": "^0.80.6"
-  },
-  "bundleDependencies": [
-    "@azure/identity"
-  ]
+  }
 }
