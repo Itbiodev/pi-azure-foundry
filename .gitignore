@@ -1,5 +1,6 @@
 node_modules/
 dist/
+.validation/
 
 # Local config — may contain API keys
 azure-foundry.config.json

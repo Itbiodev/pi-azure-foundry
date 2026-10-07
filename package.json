@@ -43,14 +43,11 @@
     "clean": "rm -rf dist",
     "prebuild": "npm run clean",
     "prepare": "npm run build",
-    "test": "vitest run",
+    "test": "vitest run src",
     "type-check": "tsc --noEmit"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "^0.80.6",
-    "@earendil-works/pi-coding-agent": "^0.80.6",
-    "@types/node": "^20",
-    "typescript": "^5",
     "vitest": "^3.2.7"
   },
   "peerDependencies": {
@@ -66,6 +63,9 @@
   },
   "dependencies": {
     "@azure/identity": "^4.13.1",
-    "@earendil-works/pi-ai": "^0.80.6"
+    "@earendil-works/pi-ai": "^0.80.6",
+    "@earendil-works/pi-coding-agent": "^0.80.6",
+    "@types/node": "^20",
+    "typescript": "^5"
   }
 }

@@ -176,6 +176,11 @@ Common use-cases include fixing stale data in the `pi-ai` catalog, setting custo
 
 ## Development
 
+Git installs build `dist/index.js` through npm's `prepare` script. TypeScript,
+Node types, and Pi's extension API types are production dependencies so this
+also works when Pi runs `npm install --omit=dev`. Generated files remain out of
+git; npm packages include `dist` as before.
+
 ```bash
 git clone https://github.com/Itbiodev/pi-azure-foundry
 cd pi-azure-foundry
@@ -189,8 +194,9 @@ pi -e .
 ```
 
 ```bash
-npm run dev       # watch mode
-npm run type-check  # type check without building
+npm test           # run the Vitest suite once (non-interactive; no Azure access)
+npm run dev        # watch mode
+npm run type-check # type check without building
 ```
 
 ---
