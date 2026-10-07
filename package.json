@@ -43,11 +43,10 @@
     "clean": "rm -rf dist",
     "prebuild": "npm run clean",
     "prepare": "npm run build",
-    "test": "vitest run src",
+    "test": "vitest run --dir src",
     "type-check": "tsc --noEmit"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.80.6",
     "vitest": "^3.2.7"
   },
   "peerDependencies": {
