@@ -12,6 +12,10 @@ All notable changes to this project are documented here. The format is based on
 - Request translation, stream parsing, multi-turn tool use, and routing tests.
 - Build-on-install support for direct git installation.
 
+### Fixed
+- `pi install git:...` no longer fails when npm omits dev dependencies.
+- `npm test` runs the Vitest suite only from `src`.
+
 ## [1.0.0] - 2025-05-22
 
 ### Added
